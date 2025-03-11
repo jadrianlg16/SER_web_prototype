@@ -5,11 +5,13 @@ import requests
 import whisper
 import uvicorn
 
-from fastapi import FastAPI, File, UploadFile, Depends
+from fastapi import FastAPI, File, UploadFile, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from typing import List, Dict
 
-# Import DB-related modules
+# Database / models
 from database import Base, engine, get_db
 from models import Transcript
 
@@ -18,8 +20,7 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
-# CORS: allow requests from frontend on http://localhost:3000
-origins = ["http://localhost:3000"]
+origins = ["http://localhost:3000"]  # Adjust if needed
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -28,43 +29,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# By default, talk to LM Studio on port 1234 on your host machine
-# Change if your LM Studio runs elsewhere or on a different port
-LMSTUDIO_URL = os.environ.get("LMSTUDIO_URL") or "http://host.docker.internal:1234"
+# LM Studio base URL (e.g. http://host.docker.internal:1234 on Docker Desktop)
+LMSTUDIO_BASE_URL = os.environ.get("LMSTUDIO_URL") or "http://host.docker.internal:1234"
 
 @app.get("/")
 def read_root():
     return {"message": "Hello from FastAPI with Docker Compose"}
 
+# -----------------------------
+# 1) Audio upload -> transcript, summary, emotion
+# -----------------------------
 @app.post("/upload")
 async def upload_audio(
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
-    """
-    1. Receive the uploaded audio file.
-    2. Transcribe with Whisper.
-    3. Send transcript to LM Studio for summary/emotion in JSON.
-    4. Store and return results.
-    """
-    # -----------------------------
-    # Save file to temporary location
-    # -----------------------------
+    # Save file
     temp_filename = f"temp_{uuid.uuid4()}_{file.filename}"
     with open(temp_filename, "wb") as f:
         f.write(await file.read())
 
-    # -----------------------------
     # Transcribe using Whisper
-    # -----------------------------
     model = whisper.load_model("base")  # or "small", "medium", etc.
     result = model.transcribe(temp_filename)
     transcript_text = result["text"]
 
-    # -----------------------------
-    # Prepare a prompt for LM Studio
-    # -----------------------------
-    # We'll instruct the LLM to return JSON with "summary" and "emotion" fields.
+    # >>> Call the LLM for summary/emotion <<<
+    # We'll instruct the LLM to respond in JSON with "summary" and "emotion" keys.
     prompt = (
         "You are a helpful assistant. The user gives you text. "
         "Respond in valid JSON only, with two keys: 'summary' for a brief summary, "
@@ -73,54 +64,50 @@ async def upload_audio(
         "{\n"
         '  "summary": "This is a summary",\n'
         '  "emotion": "Happy"\n'
-        "}\n"
+        "}\n\n"
+        f"Text: {transcript_text}\n"
+        "Please provide JSON now."
     )
 
+    summary_text = "Could not get summary"
+    emotion_text = "Unknown"
+
+    # Prepare request to LM Studio
+    lmstudio_endpoint = f"{LMSTUDIO_BASE_URL}/v1/chat/completions"
     payload = {
-        "model": "YourModelNameOrPath",  # adjust to match your loaded LM Studio model
+        "model": "YourModelNameOrPath",  # Adjust to match your loaded LM Studio model
         "messages": [
             {
                 "role": "system",
-                "content": prompt
+                "content": "You are a helpful assistant that outputs ONLY valid JSON with 'summary' and 'emotion'."
             },
             {
                 "role": "user",
-                "content": f"Text: {transcript_text}\nSummarize and provide overall emotion."
+                "content": prompt
             }
         ],
         "temperature": 0.7
     }
 
-    summary_text = "Could not get summary"
-    emotion_text = "Unknown"
-
-    # -----------------------------
-    # Call LM Studio's /v1/chat/completions endpoint
-    # -----------------------------
     try:
-        lmstudio_endpoint = f"{LMSTUDIO_URL}/v1/chat/completions"
         response = requests.post(lmstudio_endpoint, json=payload, timeout=30)
-
         if response.status_code == 200:
             data = response.json()
-            # Extract the assistant's message text
+            # The assistant's text
             assistant_message = data["choices"][0]["message"]["content"]
-            # Attempt to parse the JSON
+            # Try to parse the JSON
             try:
                 parsed = json.loads(assistant_message)
                 summary_text = parsed.get("summary", "No summary found")
                 emotion_text = parsed.get("emotion", "No emotion found")
             except json.JSONDecodeError:
-                summary_text = f"LLM responded but not in JSON: {assistant_message}"
+                summary_text = f"LLM responded but not in valid JSON: {assistant_message}"
         else:
             summary_text = f"LLM Error: status {response.status_code}"
-
     except Exception as e:
-        summary_text = f"Error: {str(e)}"
+        summary_text = f"Error calling LLM: {str(e)}"
 
-    # -----------------------------
-    # Store results in PostgreSQL
-    # -----------------------------
+    # Insert into DB
     new_transcript = Transcript(
         transcript_text=transcript_text,
         summary_text=summary_text,
@@ -130,16 +117,64 @@ async def upload_audio(
     db.commit()
     db.refresh(new_transcript)
 
-    # Clean up temp file
+    # Cleanup
     os.remove(temp_filename)
 
-    # Return final response
+    # Return transcript + ID so the frontend can use it later for chat
     return {
+        "id": new_transcript.id,
         "transcript": new_transcript.transcript_text,
         "summary": new_transcript.summary_text,
-        "emotion": new_transcript.emotion_text,
+        "emotion": new_transcript.emotion_text
     }
 
+# -----------------------------
+# Pydantic model for Chat Request
+# -----------------------------
+class ChatRequest(BaseModel):
+    transcript_id: int
+    messages: List[Dict]
+
+# -----------------------------
+# 2) Chat endpoint
+# -----------------------------
+@app.post("/chat")
+def chat_endpoint(
+    request: ChatRequest,
+    db: Session = Depends(get_db)
+):
+    transcript_obj = db.query(Transcript).filter(Transcript.id == request.transcript_id).first()
+    if not transcript_obj:
+        raise HTTPException(status_code=404, detail="Transcript not found")
+
+    # Build system context with the transcript details
+    system_prompt = (
+        "You have the following context:\n\n"
+        f"Transcript: {transcript_obj.transcript_text}\n"
+        f"Summary: {transcript_obj.summary_text}\n"
+        f"Emotion: {transcript_obj.emotion_text}\n\n"
+        "The user will ask questions or make requests based on this transcript. Provide helpful answers."
+    )
+
+    conversation = [{"role": "system", "content": system_prompt}]
+    conversation.extend(request.messages)
+
+    payload = {
+        "model": "YourModelNameOrPath",
+        "messages": conversation,
+        "temperature": 0.7
+    }
+
+    try:
+        endpoint = f"{LMSTUDIO_BASE_URL}/v1/chat/completions"
+        response = requests.post(endpoint, json=payload, timeout=30)
+        if response.status_code != 200:
+            return {"error": f"LLM error. Status: {response.status_code}"}
+        data = response.json()
+        assistant_reply = data["choices"][0]["message"]["content"]
+        return {"assistant_message": assistant_reply}
+    except Exception as e:
+        return {"error": f"Exception calling LLM: {str(e)}"}
+
 if __name__ == "__main__":
-    # Start FastAPI on port 8000
     uvicorn.run(app, host="0.0.0.0", port=8000)
