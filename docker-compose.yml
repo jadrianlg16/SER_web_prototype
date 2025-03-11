@@ -1,0 +1,37 @@
+services:
+  db:
+    image: postgres:14
+    container_name: postgres_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: transcripts_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  backend:
+    build: ./backend
+    container_name: fastapi_backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+psycopg2://postgres:postgres@db:5432/transcripts_db
+      # Point this to your running LM Studio if needed.
+      # If LM Studio is on the host at port 9000, you can keep this "http://host.docker.internal:9000"
+      - LMSTUDIO_URL=http://host.docker.internal:1234
+
+    depends_on:
+      - db
+
+  frontend:
+    build: ./frontend
+    container_name: nextjs_frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
