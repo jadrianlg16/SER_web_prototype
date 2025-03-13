@@ -6,3 +6,6 @@ pydantic
 requests
 openai-whisper
 python-multipart
+aisuite
+docstring_parser
+oci

@@ -21,6 +21,8 @@ services:
       # Point this to your running LM Studio if needed.
       # If LM Studio is on the host at port 9000, you can keep this "http://host.docker.internal:9000"
       - LMSTUDIO_URL=http://host.docker.internal:1234
+    volumes:
+      - ./.oci:/root/.oci:ro   # :ro -> read-only
 
     depends_on:
       - db
