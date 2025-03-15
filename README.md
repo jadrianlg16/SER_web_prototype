@@ -61,3 +61,8 @@ En este prototipo, aplicamos la inteligencia artificial de las siguientes manera
 ![Image of file upload, event stream, report and summary](/assets/p1.png)  
 ![Image of transcript](assets/p2.png)  
 ![Image of AI Chatbot](assets/p3.png)
+
+
+## Main Repo:
+- https://github.com/SantiagoDlrr/howl
+
